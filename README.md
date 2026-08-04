@@ -30,15 +30,9 @@ Images are published to GitHub Container Registry under the repository owner:
 
 ### Tags
 
-Available tags for docker image (based on semver):
-
-| Tag    | Container Type                 |
-| ------ | ------------------------------ |
-| main   | straight from `main` branch    |
-| latest | latest stable released version |
-| x      | specific major version         |
-| x.x    | specific minor version         |
-| x.x.x  | specific version               |
+Images are built only through a manual workflow run. In the repository's
+**Actions** tab, select **Build and publish Docker image**, choose **Run
+workflow**, and enter the tag to publish. The tag defaults to `latest`.
 
 ### Deploy
 
