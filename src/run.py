@@ -8,10 +8,10 @@ import time
 import schedule
 
 import config
+import monitor as service_monitor
 from lib.gluetun import GluetunManager
 from lib.qbit import QbitManager
 from logger import setup_logging
-from monitor import HEARTBEAT, monitor
 from util import catch_exceptions
 from ws import Windscribe
 
@@ -31,7 +31,7 @@ def main() -> None:
     - update Gluetun's VPN firewall, if configured
     - setup qbit
     """
-    if not HEARTBEAT:
+    if not service_monitor.HEARTBEAT:
         msg = (
             "From heartbeat check, "
             "qBitTorrent wasn't accessible. "
@@ -45,6 +45,7 @@ def main() -> None:
         username=config.WS_USERNAME, password=config.WS_PASSWORD, totp=config.WS_TOTP
     ) as ws:
         port = ws.setup()
+    service_monitor.set_desired_port(port)
 
     if config.GLUETUN_URL:
         with GluetunManager(
@@ -82,7 +83,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     schedule.every(config.DAYS).days.at(config.TIME).do(main)
-    schedule.every(5).minutes.do(monitor)
+    schedule.every(5).minutes.do(service_monitor.monitor)
     schedule.run_all()
 
     if not config.ONESHOT:

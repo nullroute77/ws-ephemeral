@@ -157,9 +157,13 @@ Alternatively, set `GLUETUN_USERNAME` and `GLUETUN_PASSWORD` for a basic-auth
 role. Do not set them together with `GLUETUN_API_KEY`. If the matching Gluetun
 role uses `auth = "none"`, only `GLUETUN_URL` is needed.
 
-The change is runtime state. Restarting Gluetun clears it, so restart
-ws-ephemeral with Gluetun or otherwise run ws-ephemeral again after a Gluetun
-restart.
+The change is runtime state, so restarting Gluetun clears it. With
+`ONESHOT=false`, ws-ephemeral remembers the latest Windscribe port and checks
+Gluetun every five minutes. If Gluetun reports a different port or no port,
+ws-ephemeral restores the desired port with `PUT /v1/portforward` and verifies
+the result. If Gluetun is still starting, the monitor logs the failure and
+retries on its next cycle. With `ONESHOT=true`, run ws-ephemeral again after a
+Gluetun restart because no background monitor remains active.
 
 ## Unraid Setup
 
