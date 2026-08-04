@@ -8,6 +8,7 @@ import time
 import schedule
 
 import config
+from lib.gluetun import GluetunManager
 from lib.qbit import QbitManager
 from logger import setup_logging
 from monitor import HEARTBEAT, monitor
@@ -27,6 +28,7 @@ def main() -> None:
     - check if the heartbeat was okay
     - login to ws
     - setup new matching ports
+    - update Gluetun's VPN firewall, if configured
     - setup qbit
     """
     if not HEARTBEAT:
@@ -44,6 +46,16 @@ def main() -> None:
     ) as ws:
         port = ws.setup()
 
+    if config.GLUETUN_URL:
+        with GluetunManager(
+            url=config.GLUETUN_URL,
+            timeout=config.REQUEST_TIMEOUT,
+            api_key=config.GLUETUN_API_KEY,
+            username=config.GLUETUN_USERNAME,
+            password=config.GLUETUN_PASSWORD,
+        ) as gluetun:
+            gluetun.set_forwarded_port(port)
+
     if not config.qbit_found:
         logger.warning(
             "Read the latest doc: https://github.com/dhruvinsh/ws-ephemeral#readme"
@@ -56,6 +68,7 @@ def main() -> None:
             port=config.QBIT_PORT,
             username=config.QBIT_USERNAME,
             password=config.QBIT_PASSWORD,
+            api_key=config.QBIT_API_KEY,
         )
     except Exception:
         logger.error("not able to work with qbit")
