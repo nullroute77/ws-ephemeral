@@ -51,7 +51,7 @@ docker run \
 -e WS_DEBUG=False \
 -e WS_PASSWORD=password \
 -e WS_USERNAME=username \
--e WS_TOPT=totp_token \
+-e WS_TOTP=permanent_totp_secret \
 -v /path/to/local/data:/cookie \
 ghcr.io/<repository-owner>/ws-ephemeral:latest
 ```
@@ -67,28 +67,90 @@ docker compose up -d
 
 ### Environment Variables
 
-| Variable             | Comment                                                                          |
-| -------------------- | -------------------------------------------------------------------------------- |
-| WS_USERNAME          | WS username                                                                      |
-| WS_PASSWORD          | WS password                                                                      |
-| WS_TOTP              | WS totp token for 2fa                                                            |
-| WS_DEBUG             | Enable Debug logging                                                             |
-| WS_COOKIE_PATH       | Persistent location for the cookie. (v3.x.x only)                                |
-| QBIT_USERNAME        | QBIT username                                                                    |
-| QBIT_PASSWORD        | QBIT password                                                                    |
-| QBIT_API_KEY         | QBIT API key; alternative to username/password and requires qBittorrent v5.2.0+ |
-| QBIT_HOST            | QBIT web address like, https://qbit.xyz.com or http://192.168.1.10               |
-| QBIT_PORT            | QBIT web port number like, 443 or 8080                                           |
-| QBIT_PRIVATE_TRACKER | get QBIT ready for private tracker by disabling dht, pex and lsd (true or false) |
-| GLUETUN_URL           | Gluetun control server URL; setting it enables VPN firewall port synchronization  |
-| GLUETUN_API_KEY       | API key for the Gluetun control server, if API-key authentication is configured   |
-| GLUETUN_USERNAME      | Username for Gluetun control server basic authentication                          |
-| GLUETUN_PASSWORD      | Password for Gluetun control server basic authentication                          |
-| ONESHOT              | Run and setup the code only one time so that job can be schedule externally      |
-| REQUEST_TIMEOUT      | configurable http api timeout for slow network/busy websites                     |
+| Variable              | Comment                                                                          |
+| --------------------- | -------------------------------------------------------------------------------- |
+| WS_USERNAME           | WS username                                                                      |
+| WS_PASSWORD           | WS password                                                                      |
+| WS_TOTP               | Permanent Base32 TOTP secret for Windscribe 2FA                                  |
+| WS_DEBUG              | Enable Debug logging                                                             |
+| WS_COOKIE_PATH        | Directory where the validated `cookie.json` session is stored                    |
+| WS_COOKIE_IMPORT_FILE | Optional path to a browser-exported JSON cookie file                             |
+| QBIT_USERNAME         | QBIT username                                                                    |
+| QBIT_PASSWORD         | QBIT password                                                                    |
+| QBIT_API_KEY          | QBIT API key; alternative to username/password and requires qBittorrent v5.2.0+ |
+| QBIT_HOST             | QBIT web address like, https://qbit.xyz.com or http://192.168.1.10               |
+| QBIT_PORT             | QBIT web port number like, 443 or 8080                                           |
+| QBIT_PRIVATE_TRACKER  | get QBIT ready for private tracker by disabling dht, pex and lsd (true or false) |
+| GLUETUN_URL           | Gluetun control server URL; setting it enables VPN firewall port synchronization |
+| GLUETUN_API_KEY       | API key for the Gluetun control server, if API-key authentication is configured  |
+| GLUETUN_USERNAME      | Username for Gluetun control server basic authentication                        |
+| GLUETUN_PASSWORD      | Password for Gluetun control server basic authentication                        |
+| ONESHOT               | Run and setup the code only one time so that job can be schedule externally      |
+| REQUEST_TIMEOUT       | configurable http api timeout for slow network/busy websites                     |
 
 > [!tip]
 > NOTE: for usage see [Docker Setup](#docker-setup) v2 setup guide.
+
+### Windscribe browser cookie import
+
+If Windscribe rejects automated credential login, sign in through a browser and
+export the cookies for `windscribe.com` as JSON. The import accepts the common
+browser-export array format and storage-state objects containing a `cookies`
+array. Each cookie must include `name`, `value`, `domain`, and `path`; fields
+such as `secure`, `httpOnly`, `expirationDate`, and `expires` are preserved when
+present.
+
+Place the export in the directory mounted at `WS_COOKIE_PATH` and configure its
+container path:
+
+```env
+WS_COOKIE_PATH=/cookie
+WS_COOKIE_IMPORT_FILE=/cookie/windscribe-export.json
+```
+
+For example, the file can look like:
+
+```json
+[
+  {
+    "name": "cookie-name-from-browser",
+    "value": "cookie-value-from-browser",
+    "domain": ".windscribe.com",
+    "path": "/",
+    "secure": true,
+    "httpOnly": true,
+    "expirationDate": 1893456000
+  }
+]
+```
+
+Do not replace the example names and values manually; export all cookies for
+the Windscribe domain so the complete authenticated session is available. The
+importer ignores cookies for other domains.
+
+The browser export is considered a one-time input. On startup, ws-ephemeral
+uses files in this order:
+
+1. `/cookie/cookie.json`, the maintained and validated session.
+2. `/cookie/cookie.pkl`, an existing legacy session.
+3. `WS_COOKIE_IMPORT_FILE`, the browser export.
+
+If Windscribe accepts the imported session, ws-ephemeral writes
+`/cookie/cookie.json` with owner-only permissions. The original export is then
+ignored and can be removed along with `WS_COOKIE_IMPORT_FILE`. If a legacy
+`cookie.pkl` is present, it must be moved aside to force a browser import. A
+valid legacy session is automatically migrated to JSON without deleting the
+original file.
+
+Imported and saved sessions are validated against Windscribe before use. When
+a session has expired, ws-ephemeral discards it in memory and makes one fresh
+username/password/TOTP login attempt. If that attempt is rejected or challenged,
+the invalid result is not saved. `WS_TOTP`, when used, must contain the
+permanent Base32 setup secret rather than the rotating six-digit code.
+
+Cookie files grant access to the Windscribe account. Keep the cookie directory
+private, do not commit exports to Git, and never load a `cookie.pkl` obtained
+from another person because pickle files can execute code.
 
 ### qBittorrent authentication
 

@@ -15,7 +15,7 @@ import pyotp
 import config
 from lib.decorators import login_required
 
-from .cookie import default_cookie, load_cookie, save_cookie
+from .cookie import CookieSource, default_cookie, load_cookie, save_cookie
 
 
 class Csrf(TypedDict):
@@ -25,12 +25,16 @@ class Csrf(TypedDict):
     csrf_token: str
 
 
+class WindscribeAuthenticationError(ValueError):
+    """Windscribe did not provide a usable authenticated account page."""
+
+
 @final
 class Windscribe:
     """Windscribe API to enable ephemeral ports.
 
     This class handles authentication, CSRF token management, and API requests
-    to set or delete ephemeral ports. Only works with non-2FA accounts (for now).
+    to set or delete ephemeral ports.
 
     Attributes:
         client (httpx.Client): The HTTP client for making requests.
@@ -49,11 +53,15 @@ class Windscribe:
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",  # ruff: noqa: E501
         }
 
-        self._is_authenticated = True
-        cookie = load_cookie()
-        if cookie is None:
+        self._cookie_source: CookieSource | None = None
+        loaded_cookie = load_cookie()
+        if loaded_cookie is None:
             self._is_authenticated = False
             cookie = default_cookie()
+        else:
+            self._is_authenticated = True
+            self._cookie_source = loaded_cookie.source
+            cookie = loaded_cookie.cookies
 
         self.client = httpx.Client(
             headers=headers, cookies=cookie, timeout=config.REQUEST_TIMEOUT
@@ -119,9 +127,9 @@ class Windscribe:
             Csrf: The CSRF token and time.
         """
         resp = self.client.post(config.CSRF_URL)
+        resp.raise_for_status()
         return resp.json()
 
-    @login_required
     def renew_csrf(self) -> Csrf:
         """Renew CSRF token.
 
@@ -134,13 +142,32 @@ class Windscribe:
             ValueError: If CSRF time or token is not found.
         """
         resp = self.client.get(config.MYACT_URL)
+        response_details = (
+            f"HTTP {resp.status_code}, "
+            f"content-type {resp.headers.get('content-type', 'unknown')}"
+        )
+        if not resp.is_success:
+            raise WindscribeAuthenticationError(
+                "Windscribe did not return an authenticated account page "
+                f"({response_details})."
+            )
+
         csrf_time = re.search(r"csrf_time = (?P<ctime>\d+)", resp.text)
         if csrf_time is None:
-            raise ValueError("Can not work further, csrf_time not found, exited.")
+            raise WindscribeAuthenticationError(
+                "Windscribe did not return an authenticated account page "
+                f"containing csrf_time ({response_details}). The session may have "
+                "expired or Windscribe may have returned a login challenge."
+            )
 
-        csrf_token = re.search(r"csrf_token = \'(?P<ctoken>\w+)\'", resp.text)
+        csrf_token = re.search(
+            r"csrf_token = \'(?P<ctoken>[A-Za-z0-9_-]+)\'", resp.text
+        )
         if csrf_token is None:
-            raise ValueError("Can not work further, csrf_token not found, exited.")
+            raise WindscribeAuthenticationError(
+                "Windscribe did not return an authenticated account page "
+                f"containing csrf_token ({response_details})."
+            )
 
         new_csrf: Csrf = {
             "csrf_time": int(csrf_time.groupdict()["ctime"]),
@@ -150,16 +177,29 @@ class Windscribe:
         self.logger.debug("csrf renewed successfully.")
         return new_csrf
 
-    def login(self) -> None:
+    def _reset_session(self) -> None:
+        """Discard rejected cookies before making one fresh login attempt."""
+        self.client.cookies.clear()
+        self.client.cookies.update(default_cookie())
+        self.is_authenticated = False
+        self._cookie_source = None
+
+    def login(self) -> Csrf:
         """Login to the Windscribe webpage.
 
         Authenticates the user using the provided username, password, and TOTP code (if available).
-        Updates the CSRF token and saves the session cookies for future use.
+        Validates the resulting account page before persisting the session.
         """
         # NOTE: at the given moment try to resolve totp so that we don't have any delay.
         totp = ""
         if self.totp is not None:
-            totp = pyotp.TOTP(self.totp).now()
+            try:
+                totp = pyotp.TOTP(self.totp).now()
+            except Exception as exc:
+                raise ValueError(
+                    "WS_TOTP must contain the permanent Base32 secret, not a "
+                    "rotating six-digit code"
+                ) from exc
 
         data = {
             "login": 1,
@@ -170,13 +210,27 @@ class Windscribe:
             "password": self.password,
             "code": totp,
         }
-        _ = self.client.post(config.LOGIN_URL, data=data)
+        resp = self.client.post(config.LOGIN_URL, data=data)
+        if not resp.is_success:
+            self.is_authenticated = False
+            raise WindscribeAuthenticationError(
+                f"Windscribe login request returned HTTP {resp.status_code}."
+            )
 
-        # save the cookie for the future use.
-        save_cookie(self.client.cookies)
+        try:
+            csrf = self.renew_csrf()
+        except WindscribeAuthenticationError as exc:
+            self.is_authenticated = False
+            raise WindscribeAuthenticationError(
+                "Windscribe did not accept the username/password/TOTP login or "
+                "presented an anti-automation challenge. No session was saved."
+            ) from exc
 
+        self.csrf = csrf
         self.is_authenticated = True
+        save_cookie(self.client.cookies)
         self.logger.debug("login successful")
+        return csrf
 
     @login_required
     def delete_ephm_port(self) -> dict[str, bool | int]:
@@ -240,9 +294,31 @@ class Windscribe:
         Returns:
             int: The new matching ephemeral port.
         """
-        # after login we need to update the csrf token again,
-        # windscribe puts new csrf token in the javascript
-        self.csrf = self.renew_csrf()
+        if self.is_authenticated:
+            try:
+                self.csrf = self.renew_csrf()
+            except WindscribeAuthenticationError:
+                self.logger.warning(
+                    "The saved %s session was rejected by Windscribe; trying one "
+                    "fresh credential login",
+                    self._cookie_source or "cookie",
+                )
+                self._reset_session()
+                self.csrf = self.login()
+            else:
+                save_cookie(self.client.cookies)
+                if self._cookie_source == "browser-import":
+                    self.logger.info(
+                        "Browser cookie import accepted by Windscribe and saved "
+                        "as cookie.json"
+                    )
+                elif self._cookie_source == "legacy":
+                    self.logger.info(
+                        "Legacy cookie.pkl accepted by Windscribe and migrated "
+                        "to cookie.json"
+                    )
+        else:
+            self.csrf = self.login()
 
         _ = self.delete_ephm_port()
         return self.set_matching_port()

@@ -33,8 +33,15 @@ SET_EPHEM_URL: str = STATICIP + "postEphPort"
 # WS config
 WS_USERNAME: str = os.getenv("WS_USERNAME", "")
 WS_PASSWORD: str = os.getenv("WS_PASSWORD", "")
-WS_TOTP: str | None = os.getenv("WS_TOTP", None)
-WS_COOKIE = Path(os.getenv("WS_COOKIE_PATH", ".")) / "cookie.pkl"
+WS_TOTP: str | None = os.getenv("WS_TOTP") or None
+WS_COOKIE_PATH = Path(os.getenv("WS_COOKIE_PATH", "."))
+WS_COOKIE_JSON = WS_COOKIE_PATH / "cookie.json"
+# Retained so existing installations can migrate their saved session.
+WS_COOKIE = WS_COOKIE_PATH / "cookie.pkl"
+_WS_COOKIE_IMPORT_FILE = os.getenv("WS_COOKIE_IMPORT_FILE")
+WS_COOKIE_IMPORT_FILE: Path | None = (
+    Path(_WS_COOKIE_IMPORT_FILE) if _WS_COOKIE_IMPORT_FILE else None
+)
 
 if not all([WS_USERNAME, WS_PASSWORD]):
     print("ENV: WS_USERNAME and WS_PASSWORD need to be set")
