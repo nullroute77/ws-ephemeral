@@ -8,6 +8,11 @@ All notable changes to this project will be documented in this file.
 
 - Synchronize Windscribe's ephemeral port with Gluetun's runtime VPN firewall.
 - Support qBittorrent API-key authentication.
+- Import browser-exported Windscribe cookies and persist validated sessions as JSON.
+
+### 🐛 Bug Fixes
+
+- Validate saved cookies and login responses before treating a Windscribe session as authenticated.
 
 ## [3.2.0] - 2024-08-26
 
