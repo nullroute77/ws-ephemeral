@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import pickle
+import tempfile
 from dataclasses import dataclass
 from http.cookiejar import Cookie
 from pathlib import Path
@@ -16,6 +17,7 @@ import config
 logger = logging.getLogger(__name__)
 
 CookieSource = Literal["session", "legacy", "browser-import"]
+SESSION_KEY = "ws_session_auth_hash"
 
 
 @dataclass(frozen=True)
@@ -26,12 +28,19 @@ class LoadedCookies:
     source: CookieSource
 
 
-def default_cookie() -> Cookies:
-    """Build the default unauthenticated cookie jar."""
-    cookie = Cookies()
-    cookie.set("i_can_has_cookie", "1")
-    cookie.set("ref", "https://windscribe.com/")
-    return cookie
+@dataclass(frozen=True)
+class LoadedToken:
+    """A session token extracted from an existing cookie file."""
+
+    token: str
+    source: CookieSource
+
+
+class _LegacyUnpickler(pickle.Unpickler):
+    """Read the old dictionary format without allowing executable pickle globals."""
+
+    def find_class(self, module: str, name: str) -> Any:
+        raise pickle.UnpicklingError("Legacy cookie cache contains unsupported objects")
 
 
 def _is_windscribe_domain(domain: str) -> bool:
@@ -136,8 +145,7 @@ def _cookies_from_json(path: Path, *, browser_import: bool) -> Cookies:
 def _load_legacy_cookie(path: Path) -> Cookies:
     cookies = Cookies()
     with open(path, "rb") as cookie_file:
-        # This compatibility path reads the installation's existing trusted file.
-        cookie_dict = pickle.load(cookie_file)  # noqa: S301
+        cookie_dict = _LegacyUnpickler(cookie_file).load()
 
     if not isinstance(cookie_dict, dict) or not all(
         isinstance(name, str) and isinstance(value, str)
@@ -201,9 +209,54 @@ def save_cookie(cookie: Cookies) -> None:
         )
 
     config.WS_COOKIE_JSON.parent.mkdir(parents=True, exist_ok=True)
-    temporary = config.WS_COOKIE_JSON.with_name(config.WS_COOKIE_JSON.name + ".tmp")
-    with open(temporary, "w", encoding="utf-8") as cookie_file:
-        json.dump({"version": 1, "cookies": entries}, cookie_file, indent=2)
-        cookie_file.write("\n")
-    os.chmod(temporary, 0o600)
-    temporary.replace(config.WS_COOKIE_JSON)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".cookie-", suffix=".tmp", dir=config.WS_COOKIE_JSON.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as cookie_file:
+            json.dump({"version": 1, "cookies": entries}, cookie_file, indent=2)
+            cookie_file.write("\n")
+        temporary.replace(config.WS_COOKIE_JSON)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_token() -> LoadedToken | None:
+    """Extract the API token from JSON sessions, legacy pickles, or browser exports."""
+    try:
+        loaded = load_cookie()
+    except (OSError, ValueError, EOFError, pickle.UnpicklingError):
+        if not config.WS_COOKIE_JSON.exists() and not config.WS_COOKIE.exists():
+            # An explicit browser import should give an actionable file error.
+            raise
+        logger.warning("Ignoring unreadable saved session; a fresh API login is needed")
+        return None
+
+    if loaded is None:
+        return None
+
+    tokens = {
+        cookie.value
+        for cookie in loaded.cookies.jar
+        if cookie.name == SESSION_KEY
+        and cookie.value
+        and (not cookie.domain or _is_windscribe_domain(cookie.domain))
+    }
+    if len(tokens) == 1:
+        return LoadedToken(tokens.pop(), loaded.source)
+    if tokens:
+        logger.warning("Saved cookies contain conflicting Windscribe session tokens")
+    else:
+        logger.warning("Saved cookies contain no %s API token", SESSION_KEY)
+    return None
+
+
+def save_token(token: str) -> None:
+    """Store only the accepted API token using the existing JSON session format."""
+    cookies = Cookies()
+    cookies.set(SESSION_KEY, token, domain=".windscribe.com", path="/")
+    for cookie in cookies.jar:
+        cookie.secure = True
+        cookie.set_nonstandard_attr("HttpOnly", "true")
+    save_cookie(cookies)

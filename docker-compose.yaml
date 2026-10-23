@@ -1,7 +1,7 @@
 services:
   ws-ephemeral:
     container_name: ws-ephemeral
-    image: ${WS_EPHEMERAL_IMAGE:-ghcr.io/dhruvinsh/ws-ephemeral:latest}
+    image: ${WS_EPHEMERAL_IMAGE:-ghcr.io/nullroute77/ws-ephemeral:latest}
     env_file: .env.example
     restart: unless-stopped
     volumes:

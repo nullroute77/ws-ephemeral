@@ -6,12 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### 🚀 Features
 
+- Port upstream's October 2026 Windscribe API login and ephemeral-port endpoints
+  while preserving Gluetun, qBittorrent API keys, JSON sessions, and scheduling.
+- Reuse `ws_session_auth_hash` from JSON sessions, legacy pickles, and browser exports.
 - Synchronize Windscribe's ephemeral port with Gluetun's runtime VPN firewall.
 - Support qBittorrent API-key authentication.
 - Import browser-exported Windscribe cookies and persist validated sessions as JSON.
 
 ### 🐛 Bug Fixes
 
+- Remove website CSRF scraping and old login/port URLs broken by Windscribe's redesign.
+- Retry expired API sessions once and preserve existing files when login fails.
+- Validate API errors, ports, and deletion results before continuing rotation.
+- Run regression tests before manually publishing Docker images.
 - Validate saved cookies and login responses before treating a Windscribe session as authenticated.
 
 ## [3.2.0] - 2024-08-26

@@ -1,15 +1,14 @@
 # WS-EPHEMERAL
 
 > [!WARNING]
-> Please use this tool responsibly. Excessive or inappropriate
-> usage may result in temporary suspension of your account. Due to lack of
-> time I will try to revisit sometime in future but I strongly advice to let
-> it run at default pace, that is once every week. For new user cookie generation
-> might fail at the beginning, please try again after some time once you delete
-> partially created cookie.
+> Use a single renewal container per Windscribe account and keep the default
+> six-day interval. Each container start also rotates the port. Avoid repeated
+> restarts or login attempts while troubleshooting authentication failures.
 
-> [!NOTE]
-> **Current State of the Project:** There are upstream web changes affecting this project. I am also suffering from issue and I would like implement fixes but lack of time its not possible at the moment. I plan to get back to it as soon as possible.
+This fork uses Windscribe's API for authentication and ephemeral port management,
+adapted from [upstream's October 2026 API migration](https://github.com/dhruvinsh/ws-ephemeral/commit/2f8fd86d8bb6e51dc7d9b53d9432f915b3883e79).
+It keeps Gluetun firewall synchronization, the five-minute monitor, qBittorrent
+API-key authentication, and JSON session storage.
 
 This project aims to automate setting up ephemeral port on Windscribe VPN
 service for the purpose of port forwarding. Once the setup is done it wait
@@ -26,13 +25,21 @@ Windscribe VPN and need to open the ports.
 
 Images are published to GitHub Container Registry under the repository owner:
 
-- `ghcr.io/<repository-owner>/ws-ephemeral`
+- `ghcr.io/nullroute77/ws-ephemeral`
 
 ### Tags
 
 Images are built only through a manual workflow run. In the repository's
 **Actions** tab, select **Build and publish Docker image**, choose **Run
 workflow**, and enter the tag to publish. The tag defaults to `latest`.
+For the Windscribe API migration, use the separate `api-test` tag while testing:
+
+```text
+ghcr.io/nullroute77/ws-ephemeral:api-test
+```
+
+Each manual image build runs the regression tests with Python 3.11 before it
+publishes. The **Tests** workflow is also available for manual test-only runs.
 
 ### Deploy
 
@@ -53,16 +60,16 @@ docker run \
 -e WS_USERNAME=username \
 -e WS_TOTP=permanent_totp_secret \
 -v /path/to/local/data:/cookie \
-ghcr.io/<repository-owner>/ws-ephemeral:latest
+ghcr.io/nullroute77/ws-ephemeral:latest
 ```
 
 #### Docker-compose
 
 Docker compose file is provided for example. Set `WS_EPHEMERAL_IMAGE` to the
-GHCR image for a fork if needed, make any other adjustments, and run:
+GHCR tag to test, make any other adjustments, and run:
 
 ```bash
-docker compose up -d
+WS_EPHEMERAL_IMAGE=ghcr.io/nullroute77/ws-ephemeral:api-test docker compose up -d
 ```
 
 ### Environment Variables
@@ -93,12 +100,26 @@ docker compose up -d
 
 ### Windscribe browser cookie import
 
-If Windscribe rejects automated credential login, sign in through a browser and
-export the cookies for `windscribe.com` as JSON. The import accepts the common
+The API client first tries the `ws_session_auth_hash` token from your existing
+`cookie.json`, legacy `cookie.pkl`, or browser export. It validates that token
+with Windscribe's port API, without loading the website or scraping CSRF fields.
+An accepted legacy or imported token is saved as `cookie.json`; the original
+input file remains untouched. Keep the same `WS_COOKIE_PATH` volume when updating.
+
+When there is no usable token, the client logs in through
+`https://api.windscribe.com/AuthToken/login` and `/Session`. Keep `WS_USERNAME`,
+`WS_PASSWORD`, and, when applicable, `WS_TOTP` configured. Your existing Gluetun,
+qBittorrent, and scheduling environment variables do not change.
+
+For a browser import, sign in and export the cookies for `windscribe.com` as
+JSON. The export must include `ws_session_auth_hash`; other cookie names alone
+cannot authenticate the API. An export without that token falls back to API
+credential login. The import accepts the common
 browser-export array format and storage-state objects containing a `cookies`
 array. Each cookie must include `name`, `value`, `domain`, and `path`; fields
-such as `secure`, `httpOnly`, `expirationDate`, and `expires` are preserved when
-present.
+such as `secure`, `httpOnly`, `expirationDate`, and `expires` are understood when
+present. After API validation the maintained file contains only the session
+token, because unrelated browser cookies are no longer needed.
 
 Place the export in the directory mounted at `WS_COOKIE_PATH` and configure its
 container path:
@@ -142,15 +163,19 @@ ignored and can be removed along with `WS_COOKIE_IMPORT_FILE`. If a legacy
 valid legacy session is automatically migrated to JSON without deleting the
 original file.
 
-Imported and saved sessions are validated against Windscribe before use. When
-a session has expired, ws-ephemeral discards it in memory and makes one fresh
-username/password/TOTP login attempt. If that attempt is rejected or challenged,
-the invalid result is not saved. `WS_TOTP`, when used, must contain the
+Imported and saved tokens are validated against Windscribe's API before they are
+persisted. If a cached token is rejected with a session error, ws-ephemeral makes
+one fresh username/password/TOTP login attempt and retries that request once.
+Other API errors fail the run without repeated login attempts. An API login
+that is rejected, or a new token that fails validation, does not overwrite the
+existing session file. Unreadable saved caches are ignored for fresh API login.
+`WS_TOTP`, when used, must contain the
 permanent Base32 setup secret rather than the rotating six-digit code.
 
 Cookie files grant access to the Windscribe account. Keep the cookie directory
-private, do not commit exports to Git, and never load a `cookie.pkl` obtained
-from another person because pickle files can execute code.
+private and do not commit exports to Git. Legacy pickle migration accepts only
+the old dictionary format and blocks pickle globals; JSON remains the maintained
+storage format.
 
 ### qBittorrent authentication
 
