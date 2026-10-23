@@ -1,332 +1,262 @@
-"""Windscribe module to setup ephemeral ports.
+"""Windscribe API client, adapted from upstream's October 2026 API migration."""
 
-This module provides the Windscribe class to interact with the Windscribe API,
-allowing users to manage ephemeral ports and handle authentication.
-"""
-
+import binascii
 import logging
-import re
 from types import TracebackType
-from typing import TypedDict, final
+from typing import Any, final
 
 import httpx
 import pyotp
 
 import config
-from lib.decorators import login_required
 
-from .cookie import CookieSource, default_cookie, load_cookie, save_cookie
+from .cookie import CookieSource, load_token, save_token
 
-
-class Csrf(TypedDict):
-    """CSRF type dict"""
-
-    csrf_time: int
-    csrf_token: str
+_SESSION_ERROR_CODES = {500, 701}
+_LOGIN_HINTS = {
+    702: "check WS_USERNAME, WS_PASSWORD and WS_TOTP",
+    1340: "this account uses 2FA; set WS_TOTP to its permanent Base32 secret",
+}
 
 
-class WindscribeAuthenticationError(ValueError):
-    """Windscribe did not provide a usable authenticated account page."""
+class WindscribeError(ValueError):
+    """A rejected request or unexpected Windscribe API response."""
+
+    def __init__(self, code: int | None, message: str) -> None:
+        super().__init__(f"Windscribe API [{code}]: {message}")
+        self.code = code
 
 
 @final
 class Windscribe:
-    """Windscribe API to enable ephemeral ports.
+    """Rotate a matching ephemeral port using an API session token.
 
-    This class handles authentication, CSRF token management, and API requests
-    to set or delete ephemeral ports.
-
-    Attributes:
-        client (httpx.Client): The HTTP client for making requests.
-        csrf (Csrf): The CSRF token and time.
-        username (str): The username for authentication.
-        password (str): The password for authentication.
-        totp (str | None): The TOTP secret for 2FA, if available.
-        logger (logging.Logger): Logger for the class.
+    Saved browser-cookie tokens are tried before a new credential login. A
+    rejected cached token permits one login and one retry, without scraping
+    Windscribe's website or its CSRF markup.
     """
 
-    # pylint: disable=redefined-outer-name
-    def __init__(self, username: str, password: str, totp: str | None = None) -> None:
-        headers = {
-            "origin": config.BASE_URL,
-            "referer": config.LOGIN_URL,
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",  # ruff: noqa: E501
-        }
-
-        self._cookie_source: CookieSource | None = None
-        loaded_cookie = load_cookie()
-        if loaded_cookie is None:
-            self._is_authenticated = False
-            cookie = default_cookie()
-        else:
-            self._is_authenticated = True
-            self._cookie_source = loaded_cookie.source
-            cookie = loaded_cookie.cookies
-
-        self.client = httpx.Client(
-            headers=headers, cookies=cookie, timeout=config.REQUEST_TIMEOUT
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        totp: str | None = None,
+        *,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self.logger = logging.getLogger(self.__class__.__name__)
+        loaded = load_token()
+        self.token = loaded.token if loaded else None
+        self._cookie_source: CookieSource | None = loaded.source if loaded else None
+        self._token_validated = False
+        self.client = client or httpx.Client(
+            headers={
+                "origin": config.BASE_URL.rstrip("/"),
+                "referer": config.BASE_URL,
+                "user-agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/104.0.0.0 Safari/537.36"
+                ),
+            },
+            timeout=config.REQUEST_TIMEOUT,
         )
-
-        # we will populate this later in the login call
-        self.csrf: Csrf = self.get_csrf()
         self.username = username
         self.password = password
         self.totp = totp
 
-        self.logger = logging.getLogger(self.__class__.__name__)
-
     def __enter__(self) -> "Windscribe":
-        """Context manager entry.
-
-        Returns:
-            Windscribe: The Windscribe instance.
-        """
         return self
 
     def __exit__(
         self,
-        exc_type: BaseException | None,
+        exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Context manager exit.
-
-        Closes the HTTP client session.
-
-        Args:
-            exc_type (BaseException | None): The exception type, if any.
-            exc_value (BaseException | None): The exception value, if any.
-            traceback (TracebackType | None): The traceback, if any.
-        """
         self.close()
 
-    @property
-    def is_authenticated(self) -> bool:
-        """Check if session is authenticated.
-
-        Returns:
-            bool: True if authenticated, False otherwise.
-        """
-        return self._is_authenticated
-
-    @is_authenticated.setter
-    def is_authenticated(self, value: bool) -> None:
-        """Set authentication status.
-
-        Args:
-            value (bool): The new authentication status.
-        """
-        self._is_authenticated = value
-
-    def get_csrf(self) -> Csrf:
-        """Get CSRF token.
-
-        Makes a request to the Windscribe API to get the CSRF token.
-
-        Returns:
-            Csrf: The CSRF token and time.
-        """
-        resp = self.client.post(config.CSRF_URL)
-        resp.raise_for_status()
-        return resp.json()
-
-    def renew_csrf(self) -> Csrf:
-        """Renew CSRF token.
-
-        After login, Windscribe issues a new CSRF token within JavaScript.
-
-        Returns:
-            Csrf: The new CSRF token and time.
-
-        Raises:
-            ValueError: If CSRF time or token is not found.
-        """
-        resp = self.client.get(config.MYACT_URL)
-        response_details = (
-            f"HTTP {resp.status_code}, "
-            f"content-type {resp.headers.get('content-type', 'unknown')}"
-        )
-        if not resp.is_success:
-            raise WindscribeAuthenticationError(
-                "Windscribe did not return an authenticated account page "
-                f"({response_details})."
-            )
-
-        csrf_time = re.search(r"csrf_time = (?P<ctime>\d+)", resp.text)
-        if csrf_time is None:
-            raise WindscribeAuthenticationError(
-                "Windscribe did not return an authenticated account page "
-                f"containing csrf_time ({response_details}). The session may have "
-                "expired or Windscribe may have returned a login challenge."
-            )
-
-        csrf_token = re.search(
-            r"csrf_token = \'(?P<ctoken>[A-Za-z0-9_-]+)\'", resp.text
-        )
-        if csrf_token is None:
-            raise WindscribeAuthenticationError(
-                "Windscribe did not return an authenticated account page "
-                f"containing csrf_token ({response_details})."
-            )
-
-        new_csrf: Csrf = {
-            "csrf_time": int(csrf_time.groupdict()["ctime"]),
-            "csrf_token": csrf_token.groupdict()["ctoken"],
-        }
-
-        self.logger.debug("csrf renewed successfully.")
-        return new_csrf
-
-    def _reset_session(self) -> None:
-        """Discard rejected cookies before making one fresh login attempt."""
-        self.client.cookies.clear()
-        self.client.cookies.update(default_cookie())
-        self.is_authenticated = False
-        self._cookie_source = None
-
-    def login(self) -> Csrf:
-        """Login to the Windscribe webpage.
-
-        Authenticates the user using the provided username, password, and TOTP code (if available).
-        Validates the resulting account page before persisting the session.
-        """
-        # NOTE: at the given moment try to resolve totp so that we don't have any delay.
-        totp = ""
-        if self.totp is not None:
-            try:
-                totp = pyotp.TOTP(self.totp).now()
-            except Exception as exc:
-                raise ValueError(
-                    "WS_TOTP must contain the permanent Base32 secret, not a "
-                    "rotating six-digit code"
-                ) from exc
-
-        data = {
-            "login": 1,
-            "upgrade": 0,
-            "csrf_time": self.csrf["csrf_time"],
-            "csrf_token": self.csrf["csrf_token"],
-            "username": self.username,
-            "password": self.password,
-            "code": totp,
-        }
-        resp = self.client.post(config.LOGIN_URL, data=data)
-        if not resp.is_success:
-            self.is_authenticated = False
-            raise WindscribeAuthenticationError(
-                f"Windscribe login request returned HTTP {resp.status_code}."
-            )
-
+    @staticmethod
+    def _data(response: httpx.Response) -> dict[str, Any]:
+        """Decode API errors without logging credentials or response bodies."""
         try:
-            csrf = self.renew_csrf()
-        except WindscribeAuthenticationError as exc:
-            self.is_authenticated = False
-            raise WindscribeAuthenticationError(
-                "Windscribe did not accept the username/password/TOTP login or "
-                "presented an anti-automation challenge. No session was saved."
+            body = response.json()
+        except ValueError as exc:
+            raise WindscribeError(
+                None, f"unexpected non-JSON response (HTTP {response.status_code})"
             ) from exc
 
-        self.csrf = csrf
-        self.is_authenticated = True
-        save_cookie(self.client.cookies)
-        self.logger.debug("login successful")
-        return csrf
+        if not isinstance(body, dict):
+            raise WindscribeError(None, "expected an API response object")
+        if "errorCode" in body:
+            code = body["errorCode"]
+            if isinstance(code, str) and code.isdigit():
+                code = int(code)
+            code = (
+                code if isinstance(code, int) and not isinstance(code, bool) else None
+            )
+            # Provider messages may contain account data; report a safe diagnostic.
+            hint = _LOGIN_HINTS.get(code) if code is not None else None
+            raise WindscribeError(
+                code, hint or f"request rejected (HTTP {response.status_code})"
+            )
+        if not response.is_success:
+            raise WindscribeError(None, f"request failed (HTTP {response.status_code})")
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise WindscribeError(None, "API response is missing its data object")
+        return data
 
-    @login_required
-    def delete_ephm_port(self) -> dict[str, bool | int]:
-        """Delete ephemeral port.
+    def _persist_token(self) -> None:
+        if self.token is None:
+            return
+        try:
+            save_token(self.token)
+        except OSError:
+            self.logger.warning(
+                "Could not save cookie.json; the accepted session is usable for "
+                "this run but cannot be reused on the next run"
+            )
+        else:
+            if self._cookie_source == "browser-import":
+                self.logger.info(
+                    "Browser session token accepted by Windscribe API and saved "
+                    "as cookie.json"
+                )
+            elif self._cookie_source == "legacy":
+                self.logger.info(
+                    "Legacy cookie.pkl token accepted by Windscribe API and "
+                    "migrated to cookie.json"
+                )
+        self._cookie_source = "session"
 
-        Ensures that any existing ephemeral port setting is deleted.
+    def _send(self, method: str, **kwargs: Any) -> dict[str, Any]:
+        """Send one port API request with the current token in header and form."""
+        if method != "GET":
+            kwargs["data"] = {
+                **kwargs.get("data", {}),
+                "session_auth_hash": self.token,
+            }
+        response = self.client.request(
+            method,
+            config.EPHEM_URL,
+            headers={"authorization": f"Bearer {self.token}"},
+            **kwargs,
+        )
+        return self._data(response)
 
-        Returns:
-            dict[str, bool | int]: The response from the API.
-        """
-        data = {
-            "ctime": self.csrf["csrf_time"],
-            "ctoken": self.csrf["csrf_token"],
+    def _request(self, method: str, **kwargs: Any) -> dict[str, Any]:
+        """Retry a rejected cached session once, using a newly obtained token."""
+        logged_in = self.token is None
+        if logged_in:
+            self.logger.info("No usable cached session; logging in to Windscribe API")
+            self.login()
+        try:
+            result = self._send(method, **kwargs)
+        except WindscribeError as exc:
+            if exc.code not in _SESSION_ERROR_CODES or logged_in:
+                raise
+            self.logger.warning(
+                "Saved API session rejected (code %s); trying one fresh API login",
+                exc.code,
+            )
+            self.token = None
+            self._token_validated = False
+            self.login()
+            result = self._send(method, **kwargs)
+
+        if not self._token_validated:
+            self._token_validated = True
+            self._persist_token()
+        return result
+
+    def login(self) -> None:
+        """Exchange a one-time auth token and credentials for an API session."""
+        response = self.client.post(
+            config.AUTH_TOKEN_URL,
+            json={"username": self.username, "password": self.password},
+            headers={"authorization": "Bearer anonymous"},
+        )
+        auth = self._data(response)
+        if not all(
+            isinstance(auth.get(key), str) and auth[key]
+            for key in ("token", "token_sig")
+        ):
+            raise WindscribeError(None, "login response is missing its one-time token")
+        payload: dict[str, Any] = {
+            "username": self.username,
+            "password": self.password,
+            "session_type_id": 1,
+            "platform": "legacy-web",
+            "secure_token": auth["token"],
+            "secure_token_sig": auth["token_sig"],
         }
-        resp = self.client.post(config.DEL_EPHEM_URL, data=data)
-        res = resp.json()
-        self.logger.debug("ephimeral port deleted: %s", res)
+        if self.totp:
+            try:
+                payload["2fa_code"] = pyotp.TOTP(self.totp).now()
+            except (ValueError, TypeError, binascii.Error) as exc:
+                raise ValueError(
+                    "WS_TOTP must contain the permanent Base32 secret, "
+                    "not a rotating six-digit code"
+                ) from exc
+        response = self.client.post(
+            config.SESSION_URL,
+            json=payload,
+            headers={"authorization": "Bearer anonymous"},
+        )
+        token = self._data(response).get("session_auth_hash")
+        if not isinstance(token, str) or not token.strip():
+            raise WindscribeError(None, "login response is missing its session token")
+        self.token = token
+        self._token_validated = False
+        self._cookie_source = None
+        self.logger.info("Windscribe API login successful")
 
-        return res
+    @staticmethod
+    def _port(value: Any) -> int:
+        if isinstance(value, str) and value.isdigit():
+            value = int(value)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= 65535
+        ):
+            raise WindscribeError(None, "API returned an invalid port")
+        return value
 
-    @login_required
+    def get_ephm_port(self) -> int | None:
+        data = self._request("GET")
+        if data.get("success") != 1 or "epf" not in data:
+            raise WindscribeError(None, "could not read the current ephemeral port")
+        epf = data["epf"]
+        if epf is False or epf is None:
+            return None
+        if not isinstance(epf, dict):
+            raise WindscribeError(None, "API returned an invalid ephemeral port record")
+        return self._port(epf.get("ext"))
+
+    def delete_ephm_port(self, port: int) -> None:
+        result = self._request("DELETE", data={"id": self._port(port)})
+        if result.get("success") != 1:
+            raise WindscribeError(None, "could not delete the existing ephemeral port")
+        self.logger.debug("Ephemeral port deleted: %s", port)
+
     def set_matching_port(self) -> int:
-        """Set matching ephemeral port.
-
-        Sets up a matching ephemeral port on Windscribe.
-
-        Returns:
-            int: The matching ephemeral port.
-
-        Raises:
-            ValueError: If unable to set up a matching ephemeral port or if the external and internal ports do not match.
-        """
-        data = {
-            # keeping port empty makes it to request matching port
-            "port": "",
-            "ctime": self.csrf["csrf_time"],
-            "ctoken": self.csrf["csrf_token"],
-        }
-        resp = self.client.post(config.SET_EPHEM_URL, data=data)
-        res = resp.json()
-        self.logger.debug("new ephimeral port set: %s", res)
-
-        if res["success"] != 1:
-            raise ValueError("Not able to setup matching ephemeral port.")
-
-        # lets make sure we actually had matching port
-        external: int = res["epf"]["ext"]
-        internal: int = res["epf"]["int"]
-
+        result = self._request("POST")
+        if result.get("success") != 1 or not isinstance(result.get("epf"), dict):
+            raise WindscribeError(None, "could not request a matching ephemeral port")
+        external = self._port(result["epf"].get("ext"))
+        internal = self._port(result["epf"].get("int"))
         if external != internal:
-            raise ValueError("Port setup done but matching port not found.")
-
+            raise WindscribeError(None, "Windscribe returned non-matching ports")
+        self.logger.info("New matching ephemeral port: %s", internal)
         return internal
 
     def setup(self) -> int:
-        """Perform ephemeral port setup.
-
-        After login, updates the CSRF token, deletes any existing ephemeral port,
-        and sets up a new matching ephemeral port.
-
-        Returns:
-            int: The new matching ephemeral port.
-        """
-        if self.is_authenticated:
-            try:
-                self.csrf = self.renew_csrf()
-            except WindscribeAuthenticationError:
-                self.logger.warning(
-                    "The saved %s session was rejected by Windscribe; trying one "
-                    "fresh credential login",
-                    self._cookie_source or "cookie",
-                )
-                self._reset_session()
-                self.csrf = self.login()
-            else:
-                save_cookie(self.client.cookies)
-                if self._cookie_source == "browser-import":
-                    self.logger.info(
-                        "Browser cookie import accepted by Windscribe and saved "
-                        "as cookie.json"
-                    )
-                elif self._cookie_source == "legacy":
-                    self.logger.info(
-                        "Legacy cookie.pkl accepted by Windscribe and migrated "
-                        "to cookie.json"
-                    )
-        else:
-            self.csrf = self.login()
-
-        _ = self.delete_ephm_port()
+        current = self.get_ephm_port()
+        if current is not None:
+            self.delete_ephm_port(current)
         return self.set_matching_port()
 
     def close(self) -> None:
-        """Close HTTP client session.
-
-        Closes the HTTP client session and logs the action.
-        """
-        self.logger.debug("closing session")
         self.client.close()

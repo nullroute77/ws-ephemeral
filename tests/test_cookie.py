@@ -14,7 +14,7 @@ os.environ.setdefault("WS_PASSWORD", "test-password")
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 import config
-from ws.cookie import load_cookie, save_cookie
+from ws.cookie import SESSION_KEY, load_cookie, load_token, save_cookie, save_token
 
 
 class CookieStorageTests(unittest.TestCase):
@@ -147,6 +147,60 @@ class CookieStorageTests(unittest.TestCase):
         assert loaded is not None
         self.assertEqual(loaded.source, "legacy")
         self.assertEqual(loaded.cookies.get("ws_session"), "legacy-secret")
+
+    def test_api_token_roundtrip_uses_private_json_file(self) -> None:
+        save_token("accepted-token")
+
+        loaded = load_token()
+
+        self.assertEqual(loaded.token, "accepted-token")
+        self.assertEqual(loaded.source, "session")
+        self.assertEqual(self.session_file.stat().st_mode & 0o777, 0o600)
+        cookie = json.loads(self.session_file.read_text())["cookies"][0]
+        self.assertEqual(cookie["name"], SESSION_KEY)
+        self.assertTrue(cookie["secure"])
+        self.assertTrue(cookie["httpOnly"])
+        self.assertEqual(list(self.directory.glob(".cookie-*.tmp")), [])
+
+    def test_conflicting_session_tokens_are_not_guessed(self) -> None:
+        self.write_import(
+            [
+                {"name": SESSION_KEY, "value": "one", "domain": ".windscribe.com"},
+                {"name": SESSION_KEY, "value": "two", "domain": "windscribe.com"},
+            ]
+        )
+        self.assertIsNone(load_token())
+
+    def test_non_windscribe_domain_cannot_supply_token(self) -> None:
+        self.session_file.write_text(
+            json.dumps(
+                {
+                    "cookies": [
+                        {
+                            "name": SESSION_KEY,
+                            "value": "wrong",
+                            "domain": "evilwindscribe.com",
+                        }
+                    ]
+                }
+            )
+        )
+        self.assertIsNone(load_token())
+
+    def test_corrupt_saved_cache_allows_fresh_login_without_deleting_file(self) -> None:
+        self.session_file.write_text("not json")
+        self.assertIsNone(load_token())
+        self.assertTrue(self.session_file.exists())
+
+    def test_legacy_cache_rejects_pickle_globals(self) -> None:
+        self.legacy_file.write_bytes(pickle.dumps(Path("unused")))
+        with self.assertRaises(pickle.UnpicklingError):
+            load_cookie()
+        self.assertIsNone(load_token())
+
+    def test_missing_browser_import_reports_file_path(self) -> None:
+        with self.assertRaisesRegex(FileNotFoundError, "WS_COOKIE_IMPORT_FILE"):
+            load_token()
 
 
 if __name__ == "__main__":
